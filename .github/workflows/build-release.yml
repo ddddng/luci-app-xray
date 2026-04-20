@@ -1,81 +1,110 @@
-name: Build luci-app-xray for OpenWrt 24.10
+name: Build luci-app-xray for OpenWrt 24.10.5 x86_64
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 env:
-  CACHE_DIR: ~/cache
+  PACKAGE_REPO_NAME: luci-app-xray
+  OPENWRT_VERSION: 24.10.5
+  SDK_URL_PATH: https://downloads.openwrt.org/releases/24.10.5/targets/x86/64
+  SDK_NAME_PREFIX: openwrt-sdk-24.10.5-x86-64_
+  CACHE_DIR_SDK: /home/runner/.cache/openwrt/sdk/24.10.5/x86_64
+  CACHE_DIR_DL: /home/runner/.cache/openwrt/dl/24.10.5/x86_64
+  CACHE_DIR_FEEDS: /home/runner/.cache/openwrt/feeds/24.10.5/x86_64
+  CCACHE_DIR: /home/runner/.ccache
+  CONFIG_CCACHE: y
 
 jobs:
   build:
+    name: build (x86_64, OpenWrt 24.10.5)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # 如果 opkg print-architecture 看到的是 x86_64，可直接用这组
-          - name: x86_64
-            sdk_url_path: https://downloads.openwrt.org/releases/24.10.5/targets/x86/64
-            sdk_name: -sdk-24.10.5-x86-64_
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            ccache gettext libncurses5-dev xsltproc \
-            p7zip-full zstd wget file tar unzip
+            build-essential \
+            ccache \
+            curl \
+            file \
+            gawk \
+            gettext \
+            git \
+            libncurses5-dev \
+            libncursesw5-dev \
+            rsync \
+            tar \
+            unzip \
+            wget \
+            xsltproc \
+            zstd
 
       - name: Prepare directories
         run: |
+          set -eux
+          mkdir -p "$CACHE_DIR_SDK" "$CACHE_DIR_DL" "$CACHE_DIR_FEEDS" "$CCACHE_DIR"
           echo "SDK_HOME=$(mktemp -d)" >> "$GITHUB_ENV"
-          echo "CACHE_DIR_SDK=$HOME/cache/sdk" >> "$GITHUB_ENV"
-          echo "CACHE_DIR_DL=$HOME/cache/dl" >> "$GITHUB_ENV"
-          echo "CACHE_DIR_FEEDS=$HOME/cache/feeds" >> "$GITHUB_ENV"
-          mkdir -p "$HOME/cache/sdk" "$HOME/cache/dl" "$HOME/cache/feeds" "$HOME/.ccache"
 
-      - name: Cache
+      - name: Restore caches
         uses: actions/cache@v4
         with:
           path: |
-            ${{ env.CACHE_DIR_SDK }}
-            ${{ env.CACHE_DIR_DL }}
-            ${{ env.CACHE_DIR_FEEDS }}
-            ~/.ccache
-          key: openwrt-${{ matrix.name }}-${{ github.sha }}
+            /home/runner/.ccache
+            /home/runner/.cache/openwrt/sdk/24.10.5/x86_64
+            /home/runner/.cache/openwrt/dl/24.10.5/x86_64
+            /home/runner/.cache/openwrt/feeds/24.10.5/x86_64
+          key: ${{ runner.os }}-openwrt-24.10.5-x86_64-${{ hashFiles('.github/workflows/build-release.yml') }}
           restore-keys: |
-            openwrt-${{ matrix.name }}-
+            ${{ runner.os }}-openwrt-24.10.5-x86_64-
+            ${{ runner.os }}-openwrt-24.10.5-
 
       - name: Download and extract SDK
+        shell: bash
         run: |
+          set -euxo pipefail
           cd "$CACHE_DIR_SDK"
 
-          wget -q -O - "${{ matrix.sdk_url_path }}/sha256sums" | \
-            grep -- "${{ matrix.sdk_name }}" > sha256sums.small
+          wget -q -O sha256sums "${SDK_URL_PATH}/sha256sums"
 
-          SDK_FILE="$(cut -d' ' -f2 sha256sums.small | sed 's/*//g')"
+          SDK_FILE="$(grep -m1 -- "${SDK_NAME_PREFIX}" sha256sums | awk '{print $2}' | sed 's#^\*##')"
           test -n "$SDK_FILE"
 
           if [ ! -f "$SDK_FILE" ]; then
-            wget -q "${{ matrix.sdk_url_path }}/$SDK_FILE"
+            wget -q "${SDK_URL_PATH}/${SDK_FILE}"
           fi
 
+          grep -m1 -- "${SDK_NAME_PREFIX}" sha256sums > sha256sums.small
           sha256sum -c sha256sums.small
 
-          # 兼容 OpenWrt SDK 常见压缩格式
-          7z x "$SDK_FILE" -so | tar -C "$SDK_HOME" -xvf - --strip=1
+          zstd -dc "$SDK_FILE" | tar -xf - -C "$SDK_HOME" --strip=1
+
+      - name: Debug SDK environment
+        shell: bash
+        run: |
+          set -eux
+          file "$CACHE_DIR_SDK"/*
+          tar --version
+          zstd --version
+          echo "SDK_HOME=$SDK_HOME"
+          ls -la "$SDK_HOME" | head -n 50
 
       - name: Prepare SDK
+        shell: bash
         run: |
+          set -eux
           cd "$SDK_HOME"
 
-          rm -rf dl feeds
+          rm -rf dl feeds "package/${PACKAGE_REPO_NAME}" || true
           ln -s "$CACHE_DIR_DL" dl
           ln -s "$CACHE_DIR_FEEDS" feeds
 
@@ -86,38 +115,56 @@ jobs:
           sed -i 's#git.openwrt.org/project/luci#github.com/openwrt/luci#' feeds.conf || true
           sed -i 's#git.openwrt.org/feed/telephony#github.com/openwrt/telephony#' feeds.conf || true
 
-      - name: Update feeds and install package
+      - name: Update feeds and install packages
+        shell: bash
         run: |
+          set -eux
           cd "$SDK_HOME"
+
           ./scripts/feeds update -a
 
-          # 把当前仓库挂到 SDK 里
-          ln -s "${{ github.workspace }}" package/luci-app-xray
+          ln -s "${GITHUB_WORKSPACE}" "package/${PACKAGE_REPO_NAME}"
 
           ./scripts/feeds install -a
 
-      - name: Build packages
+      - name: Generate default config
+        shell: bash
         run: |
+          set -eux
           cd "$SDK_HOME"
           make defconfig
 
-          # 主包
-          make package/luci-app-xray/core/clean V=s
-          make package/luci-app-xray/core/compile V=s
-
-          # 状态页包
-          make package/luci-app-xray/status/compile V=s
-
-          # 如需 geodata 页面，再取消下面这行注释
-          # make package/luci-app-xray/geodata/compile V=s
-
-      - name: Collect ipk
+      - name: Build luci-app-xray packages
+        shell: bash
         run: |
-          find "$SDK_HOME/bin" -type f -name "luci-app-xray*.ipk" -exec cp {} "${{ github.workspace }}/" \;
-          ls -lh ./*.ipk
+          set -eux
+          cd "$SDK_HOME"
 
-      - name: Upload release assets
+          make package/luci-app-xray/core/compile V=s
+          make package/luci-app-xray/status/compile V=s
+          make package/luci-app-xray/geodata/compile V=s
+
+      - name: Collect IPK files
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p "${GITHUB_WORKSPACE}/out"
+
+          find "$SDK_HOME/bin" -type f -name "luci-app-xray*.ipk" -exec cp -v {} "${GITHUB_WORKSPACE}/out/" \;
+
+          ls -lh "${GITHUB_WORKSPACE}/out"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-xray-openwrt-24.10.5-x86_64
+          path: out/*.ipk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish release assets
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: ./*.ipk
+          files: out/*.ipk
+          generate_release_notes: true
